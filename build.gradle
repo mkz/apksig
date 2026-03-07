@@ -2,7 +2,10 @@
 
 apply plugin: 'application'
 
-sourceCompatibility = '1.8'
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
 
 repositories {
     mavenCentral()
@@ -10,7 +13,7 @@ repositories {
 }
 
 application {
-    mainClassName 'com.android.apksigner.ApkSignerTool'
+    mainClass = 'com.android.apksigner.ApkSignerTool'
 }
 
 sourceSets {

@@ -45,6 +45,7 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
@@ -53,11 +54,11 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
+import java.util.zip.CRC32;
 
 /**
  * APK signer.
@@ -70,6 +71,19 @@ import java.util.Set;
  * @see <a href="https://source.android.com/security/apksigning/index.html">Application Signing</a>
  */
 public class ApkSigner {
+
+    /**
+     * Classification of an APK ZIP entry for the purposes of entry ordering and bitmap annotation.
+     * Ordinal order defines the write order: NATIVE_LIB first, then DEX, then OTHER_UNCOMPRESSED,
+     * then COMPRESSED. BITMAP entries are filtered out (regenerated as {@code .pages.info}).
+     */
+    private enum ApkEntryType {
+        NATIVE_LIB,
+        DEX,
+        OTHER_UNCOMPRESSED,
+        COMPRESSED,
+        BITMAP
+    }
 
     /**
      * Extensible data block/field header ID used for storing information about alignment of
@@ -85,6 +99,9 @@ public class ApkSigner {
     private static final short ALIGNMENT_ZIP_EXTRA_DATA_FIELD_MIN_SIZE_BYTES = 6;
 
     private static final short ANDROID_FILE_ALIGNMENT_BYTES = 4096;
+
+    /** Page size used for bitmap alignment, same as HAP. */
+    private static final int PAGE_SIZE = 4096;
 
     /** Name of the Android manifest ZIP entry in APKs. */
     private static final String ANDROID_MANIFEST_ZIP_ENTRY_NAME = "AndroidManifest.xml";
@@ -354,26 +371,128 @@ public class ApkSigner {
             signerEngine.inputApkSigningBlock(inputApkSigningBlock);
         }
 
-        // Step 5. Iterate over input APK's entries and output the Local File Header + data of those
-        // entries which need to be output. Entries are iterated in the order in which their Local
-        // File Header records are stored in the file. This is to achieve better data locality in
-        // case Central Directory entries are in the wrong order.
-        List<CentralDirectoryRecord> inputCdRecordsSortedByLfhOffset =
-                new ArrayList<>(inputCdRecords);
-        Collections.sort(
-                inputCdRecordsSortedByLfhOffset,
-                CentralDirectoryRecord.BY_LOCAL_FILE_HEADER_OFFSET_COMPARATOR);
+        // Step 5. Classify, sort, and output APK entries in HAP-compatible order:
+        //   1. Uncompressed NATIVE_LIB entries (lib/**/*.so), alphabetically
+        //   2. Uncompressed DEX entries (*.dex), alphabetically
+        //   3. Other uncompressed entries, alphabetically
+        //   4. Compressed entries, alphabetically
+        //   Any existing .pages.info (BITMAP) entry is dropped and regenerated.
+        //
+        // After all NATIVE_LIB + DEX entries, a .pages.info bitmap entry is inserted
+        // (4 KiB-aligned, stored). The bitmap annotates each 4 KiB page of the covered region
+        // with page-type bits (bit 0 = ELF exec-segment page, bit 1 = DEX bytecode page).
+
+        // Classify all input CD records.
+        // Entries whose AP signing policy says SKIP/OUTPUT_BY_ENGINE will be excluded from output
+        // but still passed to the signing engine via inputJarEntry().
         int lastModifiedDateForNewEntries = -1;
         int lastModifiedTimeForNewEntries = -1;
-        long inputOffset = 0;
         long outputOffset = 0;
         byte[] sourceStampCertificateDigest = null;
-        Map<String, CentralDirectoryRecord> outputCdRecordsByName =
-                new HashMap<>(inputCdRecords.size());
-        for (final CentralDirectoryRecord inputCdRecord : inputCdRecordsSortedByLfhOffset) {
+        List<CentralDirectoryRecord> outputCdRecords = new ArrayList<>(inputCdRecords.size() + 10);
+
+        // Build the sorted list of records to write (BITMAP skipped; handled separately below).
+        Comparator<CentralDirectoryRecord> entryOrder = (a, b) -> {
+            ApkEntryType ta = classifyEntry(a);
+            ApkEntryType tb = classifyEntry(b);
+            int cmp = Integer.compare(ta.ordinal(), tb.ordinal());
+            if (cmp != 0) return cmp;
+            return a.getName().compareTo(b.getName());
+        };
+        List<CentralDirectoryRecord> sortedCdRecords = new ArrayList<>();
+        for (CentralDirectoryRecord cd : inputCdRecords) {
+            ApkEntryType t = classifyEntry(cd);
+            if (t != ApkEntryType.BITMAP) {
+                sortedCdRecords.add(cd);
+            }
+        }
+        sortedCdRecords.sort(entryOrder);
+
+        // Pass 1 (dry-run): Tell the signing engine about all input entries (in sorted order
+        // for NATIVE_LIB/DEX/OTHER; BITMAP entry reported separately), and simulate output
+        // offsets for NATIVE_LIB and DEX entries to generate the bitmap.
+        List<ApkPageInfoGenerator.EntryInfo> runnableEntries = new ArrayList<>();
+        long simulatedOffset = 0;
+        for (CentralDirectoryRecord cd : sortedCdRecords) {
+            ApkEntryType t = classifyEntry(cd);
+            if (t != ApkEntryType.NATIVE_LIB && t != ApkEntryType.DEX) {
+                break; // Only simulate runnable entries
+            }
+            LocalFileRecord lfr;
+            try {
+                lfr = LocalFileRecord.getRecord(
+                        inputApkLfhSection, cd, inputApkLfhSection.size());
+            } catch (ZipFormatException e) {
+                throw new ApkFormatException("Malformed ZIP entry: " + cd.getName(), e);
+            }
+            int alignMultiple = getInputJarEntryDataAlignmentMultiple(lfr);
+            long extraStart = simulatedOffset + lfr.getExtraFieldStartOffsetInsideRecord();
+            ByteBuffer aligningExtra = createExtraFieldToAlignData(
+                    lfr.getExtra(), extraStart, alignMultiple);
+            long extraDelta = aligningExtra.remaining() - lfr.getExtra().remaining();
+            long dataOffset = simulatedOffset + lfr.getDataStartOffsetInRecord() + extraDelta;
+            long entryTotalSize = lfr.getSize() + extraDelta;
+            runnableEntries.add(new ApkPageInfoGenerator.EntryInfo(
+                    cd.getName(),
+                    t == ApkEntryType.NATIVE_LIB
+                            ? ApkPageInfoGenerator.EntryType.NATIVE_LIB
+                            : ApkPageInfoGenerator.EntryType.DEX,
+                    dataOffset,
+                    cd.getUncompressedSize(),
+                    cd));
+            simulatedOffset += entryTotalSize;
+        }
+
+        // Compute where .pages.info data will land (4 KiB-aligned after runnable entries).
+        byte[] pagesInfoNameBytes =
+                ApkPageInfoGenerator.PAGES_INFO_ENTRY_NAME.getBytes(StandardCharsets.UTF_8);
+        long pagesInfoExtraStart = simulatedOffset + 30 + pagesInfoNameBytes.length;
+        long pagesInfoDataMinStart =
+                pagesInfoExtraStart + ALIGNMENT_ZIP_EXTRA_DATA_FIELD_MIN_SIZE_BYTES;
+        long maxEntryDataOffset =
+                ((pagesInfoDataMinStart + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+
+        // Generate the bitmap.
+        byte[] bitmapData = (!runnableEntries.isEmpty())
+                ? ApkPageInfoGenerator.generateBitMap(
+                        runnableEntries, maxEntryDataOffset, inputApkLfhSection)
+                : new byte[0];
+
+        // Also notify signing engine about the existing BITMAP entry (if any), then about the
+        // SOURCE_STAMP entry (handled separately below), and the PIN_BYTE_RANGE entry.
+        for (CentralDirectoryRecord cd : inputCdRecords) {
+            String n = cd.getName();
+            if (ApkPageInfoGenerator.PAGES_INFO_ENTRY_NAME.equals(n)) {
+                signerEngine.inputJarEntry(n); // tell engine; we'll regenerate it
+            }
+        }
+
+        // Pass 2 (actual write): write entries in sorted order, injecting .pages.info after
+        // the last runnable (NATIVE_LIB + DEX) entry.
+        boolean pagesInfoInserted = false;
+        for (final CentralDirectoryRecord inputCdRecord : sortedCdRecords) {
             String entryName = inputCdRecord.getName();
+            ApkEntryType entryType = classifyEntry(inputCdRecord);
+
+            // Insert .pages.info before the first non-runnable entry (or after the last runnable).
+            if (!pagesInfoInserted
+                    && entryType != ApkEntryType.NATIVE_LIB
+                    && entryType != ApkEntryType.DEX
+                    && bitmapData.length > 0) {
+                outputOffset += outputStoredAlignedEntry(
+                        ApkPageInfoGenerator.PAGES_INFO_ENTRY_NAME,
+                        bitmapData,
+                        outputOffset,
+                        outputCdRecords,
+                        lastModifiedTimeForNewEntries < 0 ? 0 : lastModifiedTimeForNewEntries,
+                        lastModifiedDateForNewEntries < 0 ? 0x3a21 : lastModifiedDateForNewEntries,
+                        outputApkOut,
+                        signerEngine);
+                pagesInfoInserted = true;
+            }
+
             if (Hints.PIN_BYTE_RANGE_ZIP_ENTRY_NAME.equals(entryName)) {
-                continue; // We'll re-add below if needed.
+                continue; // Re-added below if needed.
             }
             if (SOURCE_STAMP_CERTIFICATE_HASH_ZIP_ENTRY_NAME.equals(entryName)) {
                 try {
@@ -383,8 +502,9 @@ public class ApkSigner {
                 } catch (ZipFormatException ex) {
                     throw new ApkFormatException("Bad source stamp entry");
                 }
-                continue; // Existing source stamp is handled below as needed.
+                continue; // Handled below as needed.
             }
+
             ApkSignerEngine.InputJarEntryInstructions entryInstructions =
                     signerEngine.inputJarEntry(entryName);
             boolean shouldOutput;
@@ -401,16 +521,6 @@ public class ApkSigner {
                             "Unknown output policy: " + entryInstructions.getOutputPolicy());
             }
 
-            long inputLocalFileHeaderStartOffset = inputCdRecord.getLocalFileHeaderOffset();
-            if (inputLocalFileHeaderStartOffset > inputOffset) {
-                // Unprocessed data in input starting at inputOffset and ending and the start of
-                // this record's LFH. We output this data verbatim because this signer is supposed
-                // to preserve as much of input as possible.
-                long chunkSize = inputLocalFileHeaderStartOffset - inputOffset;
-                inputApkLfhSection.feed(inputOffset, chunkSize, outputApkOut);
-                outputOffset += chunkSize;
-                inputOffset = inputLocalFileHeaderStartOffset;
-            }
             LocalFileRecord inputLocalFileRecord;
             try {
                 inputLocalFileRecord =
@@ -419,7 +529,6 @@ public class ApkSigner {
             } catch (ZipFormatException e) {
                 throw new ApkFormatException("Malformed ZIP entry: " + inputCdRecord.getName(), e);
             }
-            inputOffset += inputLocalFileRecord.getSize();
 
             ApkSignerEngine.InspectJarEntryRequest inspectEntryRequest =
                     entryInstructions.getInspectJarEntryRequest();
@@ -429,8 +538,7 @@ public class ApkSigner {
             }
 
             if (shouldOutput) {
-                // Find the max value of last modified, to be used for new entries added by the
-                // signer.
+                // Track max last-modified for timestamps on new entries.
                 int lastModifiedDate = inputCdRecord.getLastModificationDate();
                 int lastModifiedTime = inputCdRecord.getLastModificationTime();
                 if ((lastModifiedDateForNewEntries == -1)
@@ -479,7 +587,7 @@ public class ApkSigner {
                     }
                 }
 
-                // Enqueue entry's Central Directory record for output
+                // Enqueue entry's Central Directory record for output.
                 CentralDirectoryRecord outputCdRecord;
                 if (outputLocalFileHeaderOffset == inputLocalFileRecord.getStartOffsetInArchive()) {
                     outputCdRecord = inputCdRecord;
@@ -488,30 +596,25 @@ public class ApkSigner {
                             inputCdRecord.createWithModifiedLocalFileHeaderOffset(
                                     outputLocalFileHeaderOffset);
                 }
-                outputCdRecordsByName.put(entryName, outputCdRecord);
-            }
-        }
-        long inputLfhSectionSize = inputApkLfhSection.size();
-        if (inputOffset < inputLfhSectionSize) {
-            // Unprocessed data in input starting at inputOffset and ending and the end of the input
-            // APK's LFH section. We output this data verbatim because this signer is supposed
-            // to preserve as much of input as possible.
-            long chunkSize = inputLfhSectionSize - inputOffset;
-            inputApkLfhSection.feed(inputOffset, chunkSize, outputApkOut);
-            outputOffset += chunkSize;
-            inputOffset = inputLfhSectionSize;
-        }
-
-        // Step 6. Sort output APK's Central Directory records in the order in which they should
-        // appear in the output
-        List<CentralDirectoryRecord> outputCdRecords = new ArrayList<>(inputCdRecords.size() + 10);
-        for (CentralDirectoryRecord inputCdRecord : inputCdRecords) {
-            String entryName = inputCdRecord.getName();
-            CentralDirectoryRecord outputCdRecord = outputCdRecordsByName.get(entryName);
-            if (outputCdRecord != null) {
                 outputCdRecords.add(outputCdRecord);
             }
         }
+
+        // If all entries were runnable (no OTHER/COMPRESSED), insert .pages.info at the end.
+        if (!pagesInfoInserted && bitmapData.length > 0) {
+            outputOffset += outputStoredAlignedEntry(
+                    ApkPageInfoGenerator.PAGES_INFO_ENTRY_NAME,
+                    bitmapData,
+                    outputOffset,
+                    outputCdRecords,
+                    lastModifiedTimeForNewEntries < 0 ? 0 : lastModifiedTimeForNewEntries,
+                    lastModifiedDateForNewEntries < 0 ? 0x3a21 : lastModifiedDateForNewEntries,
+                    outputApkOut,
+                    signerEngine);
+            pagesInfoInserted = true;
+        }
+
+        // Step 6. outputCdRecords is already in write order (populated during Step 5).
 
         if (lastModifiedDateForNewEntries == -1) {
             lastModifiedDateForNewEntries = 0x3a21; // Jan 1 2009 (DOS)
@@ -691,6 +794,100 @@ public class ApkSigner {
                     uncompressedData, 0, uncompressedData.length);
             inspectEntryRequest.done();
         }
+    }
+
+    /**
+     * Classifies an APK entry for ordering and bitmap annotation purposes.
+     *
+     * <p>Entries in {@code lib/} that end with {@code .so} are NATIVE_LIB; entries ending with
+     * {@code .dex} are DEX; the literal {@code .pages.info} name is BITMAP (skip, regenerate);
+     * other uncompressed entries are OTHER_UNCOMPRESSED; compressed entries are COMPRESSED.
+     */
+    private static ApkEntryType classifyEntry(CentralDirectoryRecord cd) {
+        String name = cd.getName();
+        if (ApkPageInfoGenerator.PAGES_INFO_ENTRY_NAME.equals(name)) {
+            return ApkEntryType.BITMAP;
+        }
+        if (cd.getCompressionMethod() != ZipUtils.COMPRESSION_METHOD_STORED) {
+            return ApkEntryType.COMPRESSED;
+        }
+        if (name.startsWith("lib/") && name.endsWith(".so")) {
+            return ApkEntryType.NATIVE_LIB;
+        }
+        if (name.endsWith(".dex")) {
+            return ApkEntryType.DEX;
+        }
+        return ApkEntryType.OTHER_UNCOMPRESSED;
+    }
+
+    /**
+     * Writes a stored (uncompressed), 4 KiB-aligned Local File Header + data record for the given
+     * entry, registers it with the signing engine, and appends a CD record to {@code outputCdRecords}.
+     *
+     * @return number of bytes written to {@code output}
+     */
+    private long outputStoredAlignedEntry(
+            String entryName,
+            byte[] data,
+            long localFileHeaderOffset,
+            List<CentralDirectoryRecord> outputCdRecords,
+            int lastModifiedTime,
+            int lastModifiedDate,
+            DataSink output,
+            ApkSignerEngine signerEngine) throws IOException {
+        byte[] nameBytes = entryName.getBytes(StandardCharsets.UTF_8);
+
+        // Create 4 KiB-aligning extra field.
+        long extraStartOffset = localFileHeaderOffset + 30 + nameBytes.length;
+        ByteBuffer extra = createExtraFieldToAlignData(
+                ByteBuffer.allocate(0), extraStartOffset, PAGE_SIZE);
+
+        // Compute CRC-32.
+        CRC32 crc32Calc = new CRC32();
+        crc32Calc.update(data);
+        long crc32 = crc32Calc.getValue();
+
+        // Write Local File Header.
+        int headerSize = 30 + nameBytes.length + extra.remaining();
+        ByteBuffer header = ByteBuffer.allocate(headerSize);
+        header.order(ByteOrder.LITTLE_ENDIAN);
+        header.putInt(0x04034b50);                        // LFH signature
+        ZipUtils.putUnsignedInt16(header, 0x14);          // version needed to extract
+        header.putShort(ZipUtils.GP_FLAG_EFS);            // UTF-8 name flag
+        header.putShort(ZipUtils.COMPRESSION_METHOD_STORED);
+        ZipUtils.putUnsignedInt16(header, lastModifiedTime);
+        ZipUtils.putUnsignedInt16(header, lastModifiedDate);
+        header.putInt((int) (crc32 & 0xFFFFFFFFL));
+        header.putInt(data.length);   // compressed size = data size
+        header.putInt(data.length);   // uncompressed size
+        ZipUtils.putUnsignedInt16(header, nameBytes.length);
+        ZipUtils.putUnsignedInt16(header, extra.remaining());
+        header.put(nameBytes);
+        header.put(extra);
+        header.flip();
+        output.consume(header);
+        output.consume(data, 0, data.length);
+
+        long totalBytes = headerSize + data.length;
+
+        // Register with the signing engine (so .pages.info appears in JAR manifest).
+        ApkSignerEngine.InspectJarEntryRequest inspectRequest =
+                signerEngine.outputJarEntry(entryName);
+        if (inspectRequest != null) {
+            inspectRequest.getDataSink().consume(data, 0, data.length);
+            inspectRequest.done();
+        }
+
+        // Append Central Directory record.
+        outputCdRecords.add(CentralDirectoryRecord.createWithStoredData(
+                entryName,
+                lastModifiedTime,
+                lastModifiedDate,
+                crc32,
+                data.length,
+                localFileHeaderOffset));
+
+        return totalBytes;
     }
 
     private static long outputDataToOutputApk(

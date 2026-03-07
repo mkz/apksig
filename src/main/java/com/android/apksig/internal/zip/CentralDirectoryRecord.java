@@ -266,6 +266,55 @@ public class CentralDirectoryRecord {
                 nameBytes.length);
     }
 
+    public static CentralDirectoryRecord createWithStoredData(
+            String name,
+            int lastModifiedTime,
+            int lastModifiedDate,
+            long crc32,
+            long size,
+            long localFileHeaderOffset) {
+        byte[] nameBytes = name.getBytes(StandardCharsets.UTF_8);
+        short gpFlags = ZipUtils.GP_FLAG_EFS; // UTF-8 character encoding used for entry name
+        short compressionMethod = ZipUtils.COMPRESSION_METHOD_STORED;
+        int recordSize = HEADER_SIZE_BYTES + nameBytes.length;
+        ByteBuffer result = ByteBuffer.allocate(recordSize);
+        result.order(ByteOrder.LITTLE_ENDIAN);
+        result.putInt(RECORD_SIGNATURE);
+        ZipUtils.putUnsignedInt16(result, 0x14); // Version made by
+        ZipUtils.putUnsignedInt16(result, 0x14); // Minimum version needed to extract
+        result.putShort(gpFlags);
+        result.putShort(compressionMethod);
+        ZipUtils.putUnsignedInt16(result, lastModifiedTime);
+        ZipUtils.putUnsignedInt16(result, lastModifiedDate);
+        ZipUtils.putUnsignedInt32(result, crc32);
+        ZipUtils.putUnsignedInt32(result, size);
+        ZipUtils.putUnsignedInt32(result, size);
+        ZipUtils.putUnsignedInt16(result, nameBytes.length);
+        ZipUtils.putUnsignedInt16(result, 0); // Extra field length
+        ZipUtils.putUnsignedInt16(result, 0); // File comment length
+        ZipUtils.putUnsignedInt16(result, 0); // Disk number
+        ZipUtils.putUnsignedInt16(result, 0); // Internal file attributes
+        ZipUtils.putUnsignedInt32(result, 0); // External file attributes
+        ZipUtils.putUnsignedInt32(result, localFileHeaderOffset);
+        result.put(nameBytes);
+        if (result.hasRemaining()) {
+            throw new RuntimeException("pos: " + result.position() + ", limit: " + result.limit());
+        }
+        result.flip();
+        return new CentralDirectoryRecord(
+                result,
+                gpFlags,
+                compressionMethod,
+                lastModifiedTime,
+                lastModifiedDate,
+                crc32,
+                size,
+                size,
+                localFileHeaderOffset,
+                name,
+                nameBytes.length);
+    }
+
     static String getName(ByteBuffer record, int position, int nameLengthBytes) {
         byte[] nameBytes;
         int nameBytesOffset;
