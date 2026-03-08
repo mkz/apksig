@@ -392,12 +392,19 @@ public class ApkSigner {
         List<CentralDirectoryRecord> outputCdRecords = new ArrayList<>(inputCdRecords.size() + 10);
 
         // Build the sorted list of records to write (BITMAP skipped; handled separately below).
+        // NATIVE_LIB and DEX entries are sorted alphabetically (HAP runnable-region ordering).
+        // OTHER_UNCOMPRESSED and COMPRESSED entries are sorted by LFH offset so that gap-filling
+        // (preserving verbatim bytes between entries) works correctly.
         Comparator<CentralDirectoryRecord> entryOrder = (a, b) -> {
             ApkEntryType ta = classifyEntry(a);
             ApkEntryType tb = classifyEntry(b);
             int cmp = Integer.compare(ta.ordinal(), tb.ordinal());
             if (cmp != 0) return cmp;
-            return a.getName().compareTo(b.getName());
+            if (ta == ApkEntryType.NATIVE_LIB || ta == ApkEntryType.DEX) {
+                return a.getName().compareTo(b.getName());
+            }
+            // Sort OTHER/COMPRESSED by LFH offset to ensure correct sequential gap-filling.
+            return Long.compare(a.getLocalFileHeaderOffset(), b.getLocalFileHeaderOffset());
         };
         List<CentralDirectoryRecord> sortedCdRecords = new ArrayList<>();
         for (CentralDirectoryRecord cd : inputCdRecords) {
@@ -469,6 +476,10 @@ public class ApkSigner {
 
         // Pass 2 (actual write): write entries in sorted order, injecting .pages.info after
         // the last runnable (NATIVE_LIB + DEX) entry.
+        // inputOffset tracks the read position in the input LFH section for gap-filling.
+        // Gap-filling only applies to non-runnable entries (which keep their original order);
+        // runnable entries are reordered so their original positions don't apply.
+        long inputOffset = 0;
         boolean pagesInfoInserted = false;
         for (final CentralDirectoryRecord inputCdRecord : sortedCdRecords) {
             String entryName = inputCdRecord.getName();
@@ -521,6 +532,21 @@ public class ApkSigner {
                             "Unknown output policy: " + entryInstructions.getOutputPolicy());
             }
 
+            // For non-runnable entries: fill any gap between the previous entry and this one.
+            // This preserves verbatim bytes (e.g. alignment padding) between entries, which is
+            // required for other signers' preserved V2/V3 signatures to remain valid.
+            boolean isNonRunnable = (entryType != ApkEntryType.NATIVE_LIB
+                    && entryType != ApkEntryType.DEX);
+            if (isNonRunnable) {
+                long inputLfhOffset = inputCdRecord.getLocalFileHeaderOffset();
+                if (inputLfhOffset > inputOffset) {
+                    long chunkSize = inputLfhOffset - inputOffset;
+                    inputApkLfhSection.feed(inputOffset, chunkSize, outputApkOut);
+                    outputOffset += chunkSize;
+                    inputOffset = inputLfhOffset;
+                }
+            }
+
             LocalFileRecord inputLocalFileRecord;
             try {
                 inputLocalFileRecord =
@@ -528,6 +554,11 @@ public class ApkSigner {
                                 inputApkLfhSection, inputCdRecord, inputApkLfhSection.size());
             } catch (ZipFormatException e) {
                 throw new ApkFormatException("Malformed ZIP entry: " + inputCdRecord.getName(), e);
+            }
+
+            // Advance inputOffset past this entry's record (whether or not it is output).
+            if (isNonRunnable) {
+                inputOffset += inputLocalFileRecord.getSize();
             }
 
             ApkSignerEngine.InspectJarEntryRequest inspectEntryRequest =
@@ -598,6 +629,14 @@ public class ApkSigner {
                 }
                 outputCdRecords.add(outputCdRecord);
             }
+        }
+
+        // Copy any trailing bytes after the last non-runnable entry (e.g. trailing gap padding).
+        long inputLfhSectionSize = inputApkLfhSection.size();
+        if (inputOffset < inputLfhSectionSize) {
+            long chunkSize = inputLfhSectionSize - inputOffset;
+            inputApkLfhSection.feed(inputOffset, chunkSize, outputApkOut);
+            outputOffset += chunkSize;
         }
 
         // If all entries were runnable (no OTHER/COMPRESSED), insert .pages.info at the end.
