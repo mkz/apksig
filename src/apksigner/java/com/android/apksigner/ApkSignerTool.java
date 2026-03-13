@@ -151,6 +151,7 @@ public class ApkSignerTool {
         boolean sourceStampTimestampEnabled = true;
         boolean alignFileSize = false;
         boolean verityEnabled = false;
+        boolean codeSignEnabled = false;
         boolean debuggableApkPermitted = true;
         boolean alignmentPreserved = false;
         int libPageAlignment = LIBRARY_PAGE_ALIGNMENT_BYTES;
@@ -210,6 +211,8 @@ public class ApkSignerTool {
                 alignFileSize = true;
             } else if ("verity-enabled".equals(optionName)) {
                 verityEnabled = optionsParser.getOptionalBooleanValue(true);
+            } else if ("code-sign-enabled".equals(optionName)) {
+                codeSignEnabled = optionsParser.getOptionalBooleanValue(true);
             } else if ("debuggable-apk-permitted".equals(optionName)) {
                 debuggableApkPermitted = optionsParser.getOptionalBooleanValue(true);
             } else if ("alignment-preserved".equals(optionName)) {
@@ -406,6 +409,7 @@ public class ApkSignerTool {
                         .setSourceStampTimestampEnabled(sourceStampTimestampEnabled)
                         .setAlignFileSize(alignFileSize)
                         .setVerityEnabled(verityEnabled)
+                        .setCodeSignEnabled(codeSignEnabled)
                         .setV4ErrorReportingEnabled(v4SigningEnabled && v4SigningFlagFound)
                         .setDebuggableApkPermitted(debuggableApkPermitted)
                         .setSigningCertificateLineage(lineage)

@@ -55,6 +55,11 @@ certificate.
 --verity-enabled      Whether to enable the verity signature algorithm for the
                       v2 and v3 signature schemes.
 
+--code-sign-enabled   Whether to embed an OpenHarmony-compatible code sign block
+                      in the APK Signing Block. The block contains an fs-verity
+                      root hash and PKCS#7 signature for kernel-level on-access
+                      verification. Disabled by default.
+
 --min-sdk-version     Lowest API Level on which this APK's signatures will be
                       verified. By default, the value from AndroidManifest.xml
                       is used. The higher the value, the stronger security
