@@ -100,6 +100,7 @@ public class DefaultApkSignerEngine implements ApkSignerEngine {
     private final boolean mV2SigningEnabled;
     private final boolean mV3SigningEnabled;
     private final boolean mVerityEnabled;
+    private final boolean mCodeSignEnabled;
     private final boolean mDebuggableApkPermitted;
     private final boolean mOtherSignersSignaturesPreserved;
     private final String mCreatedBy;
@@ -113,6 +114,9 @@ public class DefaultApkSignerEngine implements ApkSignerEngine {
 
     private List<byte[]> mPreservedV2Signers = Collections.emptyList();
     private List<Pair<byte[], Integer>> mPreservedSignatureBlocks = Collections.emptyList();
+
+    /** Pre-built code sign block bytes to include in the APK Signing Block, or null. */
+    private byte[] mCodeSignBlock;
 
     private List<V1SchemeSigner.SignerConfig> mV1SignerConfigs = Collections.emptyList();
     private DigestAlgorithm mV1ContentDigestAlgorithm;
@@ -196,6 +200,7 @@ public class DefaultApkSignerEngine implements ApkSignerEngine {
             boolean v2SigningEnabled,
             boolean v3SigningEnabled,
             boolean verityEnabled,
+            boolean codeSignEnabled,
             boolean debuggableApkPermitted,
             boolean otherSignersSignaturesPreserved,
             String createdBy,
@@ -209,6 +214,7 @@ public class DefaultApkSignerEngine implements ApkSignerEngine {
         mV2SigningEnabled = v2SigningEnabled;
         mV3SigningEnabled = v3SigningEnabled;
         mVerityEnabled = verityEnabled;
+        mCodeSignEnabled = codeSignEnabled;
         mV1SignaturePending = v1SigningEnabled;
         mV2SignaturePending = v2SigningEnabled;
         mV3SignaturePending = v3SigningEnabled;
@@ -1152,6 +1158,12 @@ public class DefaultApkSignerEngine implements ApkSignerEngine {
             signingSchemeBlocks.add(v2SourceStampSigner.generateSourceStampBlock());
         }
 
+        // Add code sign block if present
+        if (mCodeSignEnabled && mCodeSignBlock != null) {
+            signingSchemeBlocks.add(
+                    Pair.of(mCodeSignBlock, ApkSigningBlockUtils.APK_CODE_SIGN_BLOCK_ID));
+        }
+
         // create APK Signing Block with v2 and/or v3 and/or SourceStamp blocks
         byte[] apkSigningBlock = ApkSigningBlockUtils.generateApkSigningBlock(signingSchemeBlocks);
 
@@ -1202,6 +1214,33 @@ public class DefaultApkSignerEngine implements ApkSignerEngine {
         } catch (InvalidKeyException | IOException | NoSuchAlgorithmException e) {
             throw new SignatureException("V4 signing failed", e);
         }
+    }
+
+    /** Returns whether code signing is enabled for this engine. */
+    public boolean isCodeSignEnabled() {
+        return mCodeSignEnabled;
+    }
+
+    /**
+     * Sets the pre-built code sign block bytes. Called by {@code ApkSigner} after computing
+     * the root hash and PKCS#7 signature over the LFH section.
+     */
+    public void setCodeSignBlock(byte[] codeSignBlock) {
+        mCodeSignBlock = codeSignBlock;
+    }
+
+    /**
+     * Returns the first signer's key config and certificates, for use by the caller to
+     * produce the PKCS#7 code sign signature.
+     */
+    public SignerConfig getFirstSignerConfig() {
+        if (!mSignerConfigs.isEmpty()) {
+            return mSignerConfigs.get(0);
+        }
+        if (!mTargetedSignerConfigs.isEmpty()) {
+            return mTargetedSignerConfigs.get(0);
+        }
+        throw new IllegalStateException("No signer configs available");
     }
 
     @Override
@@ -1898,6 +1937,7 @@ public class DefaultApkSignerEngine implements ApkSignerEngine {
         private int mRotationMinSdkVersion = V3SchemeConstants.DEFAULT_ROTATION_MIN_SDK_VERSION;
         private boolean mRotationTargetsDevRelease = false;
         private boolean mVerityEnabled = false;
+        private boolean mCodeSignEnabled = false;
         private boolean mDebuggableApkPermitted = true;
         private boolean mOtherSignersSignaturesPreserved;
         private String mCreatedBy = "1.0 (Android)";
@@ -2126,6 +2166,7 @@ public class DefaultApkSignerEngine implements ApkSignerEngine {
                     mV2SigningEnabled,
                     mV3SigningEnabled,
                     mVerityEnabled,
+                    mCodeSignEnabled,
                     mDebuggableApkPermitted,
                     mOtherSignersSignaturesPreserved,
                     mCreatedBy,
@@ -2203,6 +2244,18 @@ public class DefaultApkSignerEngine implements ApkSignerEngine {
          */
         public Builder setVerityEnabled(boolean enabled) {
             mVerityEnabled = enabled;
+            return this;
+        }
+
+        /**
+         * Sets whether an OpenHarmony-compatible code sign block should be embedded in the
+         * APK Signing Block. The code sign block contains an fs-verity root hash and PKCS#7
+         * signature that can be used by the kernel for on-access verification.
+         *
+         * <p>By default, code signing is disabled.
+         */
+        public Builder setCodeSignEnabled(boolean enabled) {
+            mCodeSignEnabled = enabled;
             return this;
         }
 

@@ -19,7 +19,7 @@ application {
 sourceSets {
     main {
         java {
-            srcDirs 'src/main/java', 'src/apksigner/java'
+            srcDirs 'src/main/java', 'src/apksigner/java', 'src/apkverify/java'
         }
         resources {
             srcDirs 'src/apksigner/java'
@@ -41,6 +41,11 @@ tasks.register('createTestAwsData', JavaExec) {
 tasks.register('createTestGcpData', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'com.android.apksig.kms.gcp.GcpTestData'
+}
+
+tasks.register('runApkVerify', JavaExec) {
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.android.apkverify.ApkVerifyTool'
 }
 
 dependencies {

@@ -25,9 +25,15 @@ import com.android.apksig.apk.ApkFormatException;
 import com.android.apksig.apk.ApkSigningBlockNotFoundException;
 import com.android.apksig.apk.ApkUtils;
 import com.android.apksig.apk.MinSdkVersionException;
+import com.android.apksig.internal.apk.ApkSigningBlockUtils;
 import com.android.apksig.internal.apk.v3.V3SchemeConstants;
+import com.android.apksig.internal.codesign.CodeSignBlock;
+import com.android.apksig.internal.codesign.CodeSignConstants;
+import com.android.apksig.internal.codesign.FsVerityDescriptor;
+import com.android.apksig.internal.pkcs7.AlgorithmIdentifier;
 import com.android.apksig.internal.util.AndroidSdkVersion;
 import com.android.apksig.internal.util.ByteBufferDataSource;
+import com.android.apksig.internal.util.VerityTreeBuilder;
 import com.android.apksig.internal.zip.CentralDirectoryRecord;
 import com.android.apksig.internal.zip.EocdRecord;
 import com.android.apksig.internal.zip.LocalFileRecord;
@@ -49,6 +55,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
 import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.SignatureException;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
@@ -120,6 +127,7 @@ public class ApkSigner {
     private final boolean mV4SigningEnabled;
     private final boolean mAlignFileSize;
     private final boolean mVerityEnabled;
+    private final boolean mCodeSignEnabled;
     private final boolean mV4ErrorReportingEnabled;
     private final boolean mDebuggableApkPermitted;
     private final boolean mOtherSignersSignaturesPreserved;
@@ -155,6 +163,7 @@ public class ApkSigner {
             boolean v4SigningEnabled,
             boolean alignFileSize,
             boolean verityEnabled,
+            boolean codeSignEnabled,
             boolean v4ErrorReportingEnabled,
             boolean debuggableApkPermitted,
             boolean otherSignersSignaturesPreserved,
@@ -184,6 +193,7 @@ public class ApkSigner {
         mV4SigningEnabled = v4SigningEnabled;
         mAlignFileSize = alignFileSize;
         mVerityEnabled = verityEnabled;
+        mCodeSignEnabled = codeSignEnabled;
         mV4ErrorReportingEnabled = v4ErrorReportingEnabled;
         mDebuggableApkPermitted = debuggableApkPermitted;
         mOtherSignersSignaturesPreserved = otherSignersSignaturesPreserved;
@@ -341,6 +351,7 @@ public class ApkSigner {
                             .setV2SigningEnabled(mV2SigningEnabled)
                             .setV3SigningEnabled(mV3SigningEnabled)
                             .setVerityEnabled(mVerityEnabled)
+                            .setCodeSignEnabled(mCodeSignEnabled)
                             .setDebuggableApkPermitted(mDebuggableApkPermitted)
                             .setOtherSignersSignaturesPreserved(mOtherSignersSignaturesPreserved)
                             .setSigningCertificateLineage(mSigningCertificateLineage)
@@ -763,6 +774,16 @@ public class ApkSigner {
                         outputCentralDirRecordCount,
                         outputCentralDirDataSource.size(),
                         outputCentralDirStartOffset);
+
+        // Step 10.5. If code signing is enabled, compute the code sign block and pass it
+        // to the engine before outputZipSections2() assembles the APK Signing Block.
+        if (signerEngine instanceof DefaultApkSignerEngine) {
+            DefaultApkSignerEngine dEngine = (DefaultApkSignerEngine) signerEngine;
+            if (dEngine.isCodeSignEnabled()) {
+                buildAndSetCodeSignBlock(
+                        dEngine, outputApkIn, outputCdRecords, outputCentralDirStartOffset);
+            }
+        }
 
         // Step 11. Generate and output APK Signature Scheme v2 and/or v3 signatures and/or
         // SourceStamp signatures, if necessary.
@@ -1259,6 +1280,124 @@ public class ApkSigner {
     }
 
     /**
+     * Computes the fs-verity root hash over the LFH section, signs it, builds the code sign
+     * block, and passes it to the engine for inclusion in the APK Signing Block.
+     */
+    private static void buildAndSetCodeSignBlock(
+            DefaultApkSignerEngine engine,
+            DataSource outputApkIn,
+            List<CentralDirectoryRecord> outputCdRecords,
+            long lfhSectionSize)
+            throws IOException, NoSuchAlgorithmException, InvalidKeyException, SignatureException {
+
+        // The LFH section is everything from offset 0 to outputCentralDirStartOffset.
+        DataSource lfhSection = outputApkIn.slice(0, lfhSectionSize);
+
+        // Compute root hash using VerityTreeBuilder (SHA-256, no salt).
+        byte[] rootHash32;
+        try (VerityTreeBuilder vtb = new VerityTreeBuilder(null)) {
+            rootHash32 = vtb.generateVerityTreeRootHash(lfhSection);
+        }
+        // Zero-pad root hash to 64 bytes.
+        byte[] rootHash = new byte[CodeSignConstants.ROOT_HASH_SIZE];
+        System.arraycopy(rootHash32, 0, rootHash, 0, rootHash32.length);
+
+        // Find .pages.info entry's absolute data offset and size.
+        long mapOffset = 0;
+        long mapSize = 0;
+        for (CentralDirectoryRecord cd : outputCdRecords) {
+            if (ApkPageInfoGenerator.PAGES_INFO_ENTRY_NAME.equals(cd.getName())) {
+                // Data offset = LFH offset + 30 + name_length + extra_length
+                // But we can get it from the LocalFileRecord. However, we don't have that
+                // here. Use the CD record info: LFH offset + header size.
+                // For a stored entry we created: header = 30 + name + extra.
+                // Get the actual LFR to find the data start.
+                try {
+                    LocalFileRecord lfr = LocalFileRecord.getRecord(
+                            lfhSection, cd, lfhSection.size());
+                    mapOffset = cd.getLocalFileHeaderOffset()
+                            + lfr.getDataStartOffsetInRecord();
+                    mapSize = cd.getUncompressedSize();
+                } catch (ZipFormatException e) {
+                    throw new IOException("Failed to read .pages.info LFR", e);
+                }
+                break;
+            }
+        }
+
+        // Build FsVerityDescriptor for signing.
+        FsVerityDescriptor descriptor = new FsVerityDescriptor(
+                CodeSignConstants.HASH_ALGORITHM_SHA256,
+                CodeSignConstants.LOG2_BLOCK_SIZE_4096,
+                (byte) 0, // saltSize
+                lfhSectionSize,
+                rootHash,
+                new byte[CodeSignConstants.SALT_SIZE],
+                0, // flags: no inlined tree
+                0, // merkleTreeOffset
+                mapOffset,
+                mapSize,
+                CodeSignConstants.PAGE_INFO_DEFAULT_UNIT_SIZE);
+        byte[] descriptorDigestBytes = descriptor.getDigestBytes();
+
+        // Sign the descriptor with PKCS#7 using the first signer's key.
+        DefaultApkSignerEngine.SignerConfig signerConfig = engine.getFirstSignerConfig();
+        KeyConfig keyConfig = signerConfig.getKeyConfig();
+        List<X509Certificate> certs = signerConfig.getCertificates();
+        PublicKey publicKey = certs.get(0).getPublicKey();
+
+        // Determine JCA signature algorithm based on key type.
+        String keyAlgorithm = publicKey.getAlgorithm();
+        String jcaSignatureAlgorithm;
+        if ("RSA".equalsIgnoreCase(keyAlgorithm)) {
+            jcaSignatureAlgorithm = "SHA256withRSA";
+        } else if ("EC".equalsIgnoreCase(keyAlgorithm)) {
+            jcaSignatureAlgorithm = "SHA256withECDSA";
+        } else if ("DSA".equalsIgnoreCase(keyAlgorithm)) {
+            jcaSignatureAlgorithm = "SHA256withDSA";
+        } else {
+            throw new InvalidKeyException("Unsupported key algorithm: " + keyAlgorithm);
+        }
+
+        // Cryptographically sign the descriptor.
+        byte[] signatureBytes;
+        try {
+            signatureBytes = SignerEngineFactory.getImplementation(
+                    keyConfig, jcaSignatureAlgorithm, null).sign(descriptorDigestBytes);
+        } catch (java.security.InvalidAlgorithmParameterException e) {
+            throw new SignatureException("Failed to sign code sign descriptor", e);
+        }
+
+        // Build PKCS#7 DER-encoded message using the V1 signer's algorithm selection.
+        com.android.apksig.internal.util.Pair<String, AlgorithmIdentifier> sigAlgPair;
+        try {
+            sigAlgPair = AlgorithmIdentifier.getSignerInfoSignatureAlgorithm(
+                    publicKey,
+                    com.android.apksig.internal.apk.v1.DigestAlgorithm.SHA256,
+                    false);
+        } catch (InvalidKeyException e) {
+            throw new InvalidKeyException("Unsupported key for code signing: " + keyAlgorithm, e);
+        }
+        AlgorithmIdentifier digestAlgId = AlgorithmIdentifier.getSignerInfoDigestAlgorithmOid(
+                com.android.apksig.internal.apk.v1.DigestAlgorithm.SHA256);
+        AlgorithmIdentifier sigAlgId = sigAlgPair.getSecond();
+
+        byte[] pkcs7Signature;
+        try {
+            pkcs7Signature = ApkSigningBlockUtils.generatePkcs7DerEncodedMessage(
+                    signatureBytes, null, certs, digestAlgId, sigAlgId);
+        } catch (Exception e) {
+            throw new SignatureException("Failed to generate PKCS#7 code sign signature", e);
+        }
+
+        // Assemble the code sign block.
+        byte[] codeSignBlock = CodeSignBlock.build(
+                rootHash, pkcs7Signature, lfhSectionSize, mapOffset, mapSize);
+
+        engine.setCodeSignBlock(codeSignBlock);
+    }
+
+    /**
      * Configuration of a signer.
      *
      * <p>Use {@link Builder} to obtain configuration instances.
@@ -1509,6 +1648,7 @@ public class ApkSigner {
         private boolean mV4SigningEnabled = true;
         private boolean mAlignFileSize = false;
         private boolean mVerityEnabled = false;
+        private boolean mCodeSignEnabled = false;
         private boolean mV4ErrorReportingEnabled = false;
         private boolean mDebuggableApkPermitted = true;
         private boolean mOtherSignersSignaturesPreserved;
@@ -1926,6 +2066,21 @@ public class ApkSigner {
         }
 
         /**
+         * Sets whether an OpenHarmony-compatible code sign block should be embedded in the
+         * APK Signing Block. The block contains an fs-verity root hash and PKCS#7 signature
+         * for kernel-level on-access verification.
+         *
+         * <p>By default, code signing is disabled.
+         *
+         * @param enabled {@code true} to embed a code sign block in the APK Signing Block
+         */
+        public Builder setCodeSignEnabled(boolean enabled) {
+            checkInitializedWithoutEngine();
+            mCodeSignEnabled = enabled;
+            return this;
+        }
+
+        /**
          * Sets whether the APK should be signed even if it is marked as debuggable ({@code
          * android:debuggable="true"} in its {@code AndroidManifest.xml}). For backward
          * compatibility reasons, the default value of this setting is {@code true}.
@@ -2068,6 +2223,7 @@ public class ApkSigner {
                     mV4SigningEnabled,
                     mAlignFileSize,
                     mVerityEnabled,
+                    mCodeSignEnabled,
                     mV4ErrorReportingEnabled,
                     mDebuggableApkPermitted,
                     mOtherSignersSignaturesPreserved,

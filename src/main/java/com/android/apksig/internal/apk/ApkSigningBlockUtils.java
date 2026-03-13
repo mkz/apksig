@@ -99,6 +99,9 @@ public class ApkSigningBlockUtils {
           };
     public static final int VERITY_PADDING_BLOCK_ID = 0x42726577;
 
+    /** APK Signing Block ID for the OpenHarmony code sign block ("OHCS"). */
+    public static final int APK_CODE_SIGN_BLOCK_ID = 0x4F484353;
+
     private static final ContentDigestAlgorithm[] V4_CONTENT_DIGEST_ALGORITHMS =
             {CHUNKED_SHA512, VERITY_CHUNKED_SHA256, CHUNKED_SHA256};
 
