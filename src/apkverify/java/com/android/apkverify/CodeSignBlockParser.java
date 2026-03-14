@@ -18,6 +18,9 @@ package com.android.apkverify;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Parses a binary code sign block (as produced by
@@ -42,11 +45,14 @@ public final class CodeSignBlockParser {
     // HapInfoSegment magic
     private static final int HAP_INFO_MAGIC = 0xCC66C1B5;
 
+    // NativeLibInfoSegment magic
+    private static final int NATIVE_LIB_INFO_MAGIC = 0x0ED2E720;
+
     // Extension types
     private static final int EXT_MERKLE_TREE = 0x1;
     private static final int EXT_PAGE_INFO = 0x2;
 
-    // Parsed fields
+    // Parsed fields — whole-file
     public byte hashAlgorithm;
     public byte logBlockSize;
 
@@ -65,6 +71,24 @@ public final class CodeSignBlockParser {
     public long pageInfoMapOffset;
     public long pageInfoMapSize;
     public byte pageInfoUnitSize;
+
+    // Parsed fields — per-SO native libs
+    public int nativeLibCount;
+    public List<NativeLibEntry> nativeLibEntries = new ArrayList<>();
+
+    /**
+     * Parsed per-SO entry from NativeLibInfoSegment.
+     */
+    public static class NativeLibEntry {
+        public String fileName;
+        public int sigSize;
+        public int signInfoFlags;
+        public long dataSize;
+        public byte[] signature;
+        public byte[] rootHash;
+        public long soMapOffset;
+        public long soMapSize;
+    }
 
     private CodeSignBlockParser() {}
 
@@ -112,7 +136,7 @@ public final class CodeSignBlockParser {
                     parseHapInfoSegment(buf, segSizes[i], result);
                     break;
                 case SEG_NATIVE_LIB_INFO:
-                    // Stub segment, skip
+                    parseNativeLibInfoSegment(buf, segSizes[i], result);
                     break;
             }
         }
@@ -161,40 +185,119 @@ public final class CodeSignBlockParser {
         result.signature = new byte[result.sigSize];
         buf.get(result.signature);
 
-        // Skip alignment padding to reach extensions
-        // extensionOffset is relative to start of SignInfo (= hapMagic position + 4)
-        // We need to jump to the right position for extensions.
-        // The SignInfo starts at hapMagic+4. extensionOffset is from there.
-        // Current position should be near extensionOffset, but may need alignment skip.
-        // Just parse extensions sequentially from here, accounting for padding.
-
         // Align to 4 bytes after signature
         int sigEnd = buf.position();
         int padding = (4 - (result.sigSize % 4)) % 4;
         buf.position(sigEnd + padding);
 
         // Parse extensions
+        parseExtensions(buf, extensionNum, result, null);
+    }
+
+    private static void parseNativeLibInfoSegment(
+            ByteBuffer buf, int segSize, CodeSignBlockParser result) {
+        int segStart = buf.position();
+
+        int nlMagic = buf.getInt();
+        if (nlMagic != NATIVE_LIB_INFO_MAGIC) {
+            throw new IllegalArgumentException(
+                    "Bad NativeLibInfo magic: 0x" + Integer.toHexString(nlMagic));
+        }
+        int segmentSize = buf.getInt();
+        int sectionNum = buf.getInt();
+        result.nativeLibCount = sectionNum;
+
+        if (sectionNum == 0) {
+            return; // stub segment
+        }
+
+        // Read entry table
+        int[] fileNameOffsets = new int[sectionNum];
+        int[] fileNameSizes = new int[sectionNum];
+        int[] signInfoOffsets = new int[sectionNum];
+        int[] signInfoSizes = new int[sectionNum];
+        for (int i = 0; i < sectionNum; i++) {
+            fileNameOffsets[i] = buf.getInt();
+            fileNameSizes[i] = buf.getInt();
+            signInfoOffsets[i] = buf.getInt();
+            signInfoSizes[i] = buf.getInt();
+        }
+
+        for (int i = 0; i < sectionNum; i++) {
+            NativeLibEntry entry = new NativeLibEntry();
+
+            // Read filename
+            buf.position(segStart + fileNameOffsets[i]);
+            byte[] nameBytes = new byte[fileNameSizes[i]];
+            buf.get(nameBytes);
+            entry.fileName = new String(nameBytes, StandardCharsets.UTF_8);
+
+            // Parse SignInfo
+            buf.position(segStart + signInfoOffsets[i]);
+            int saltSize = buf.getInt();
+            entry.sigSize = buf.getInt();
+            entry.signInfoFlags = buf.getInt();
+            entry.dataSize = buf.getLong();
+            buf.position(buf.position() + 32); // skip salt
+            int extensionNum = buf.getInt();
+            int extensionOffset = buf.getInt();
+
+            // Read signature
+            entry.signature = new byte[entry.sigSize];
+            buf.get(entry.signature);
+
+            // Align past signature
+            int sigPadding = (4 - (entry.sigSize % 4)) % 4;
+            buf.position(buf.position() + sigPadding);
+
+            // Parse extensions
+            parseExtensions(buf, extensionNum, null, entry);
+
+            result.nativeLibEntries.add(entry);
+        }
+    }
+
+    /**
+     * Parses extensions. Populates either the whole-file result or a per-SO entry.
+     */
+    private static void parseExtensions(
+            ByteBuffer buf, int extensionNum,
+            CodeSignBlockParser result, NativeLibEntry entry) {
         for (int i = 0; i < extensionNum; i++) {
             int extType = buf.getInt();
             int extDataSize = buf.getInt();
             int extDataStart = buf.position();
             switch (extType) {
                 case EXT_MERKLE_TREE:
-                    result.merkleTreeSize = buf.getLong();
-                    result.merkleTreeOffset = buf.getLong();
-                    result.rootHash = new byte[64];
-                    buf.get(result.rootHash);
+                    long treeSize = buf.getLong();
+                    long treeOffset = buf.getLong();
+                    byte[] rh = new byte[64];
+                    buf.get(rh);
+                    if (result != null) {
+                        result.merkleTreeSize = treeSize;
+                        result.merkleTreeOffset = treeOffset;
+                        result.rootHash = rh;
+                    } else if (entry != null) {
+                        entry.rootHash = rh;
+                    }
                     break;
                 case EXT_PAGE_INFO:
-                    result.hasPageInfo = true;
-                    result.pageInfoMapOffset = buf.getLong();
-                    result.pageInfoMapSize = buf.getLong();
-                    result.pageInfoUnitSize = buf.get();
+                    long mo = buf.getLong();
+                    long ms = buf.getLong();
+                    byte us = buf.get();
                     buf.get(new byte[3]); // reserved
-                    buf.getInt(); // signSize (unused for now)
+                    buf.getInt(); // signSize
+                    if (result != null) {
+                        result.hasPageInfo = true;
+                        result.pageInfoMapOffset = mo;
+                        result.pageInfoMapSize = ms;
+                        result.pageInfoUnitSize = us;
+                    } else if (entry != null) {
+                        entry.soMapOffset = mo;
+                        entry.soMapSize = ms;
+                    }
                     break;
                 default:
-                    // Unknown extension, skip
                     break;
             }
             buf.position(extDataStart + extDataSize);

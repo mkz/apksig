@@ -110,12 +110,25 @@ public final class ApkVerifyTool {
                 System.out.println("  pageInfo.unitSize: " + parsed.pageInfoUnitSize);
             }
 
+            // Print per-SO native lib info
+            if (parsed.nativeLibCount > 0) {
+                System.out.println("  nativeLibCount: " + parsed.nativeLibCount);
+                for (CodeSignBlockParser.NativeLibEntry entry : parsed.nativeLibEntries) {
+                    System.out.println("  nativeLib: " + entry.fileName);
+                    System.out.println("    dataSize: " + entry.dataSize);
+                    System.out.println("    soMapOffset: " + entry.soMapOffset);
+                    System.out.println("    soMapSize: " + entry.soMapSize);
+                    System.out.println("    rootHash: " + bytesToHex(entry.rootHash, 32));
+                    System.out.println("    sigSize: " + entry.sigSize);
+                }
+            }
+
             if (dryRun) {
                 System.out.println("Dry run — not calling ioctl.");
                 return;
             }
 
-            // Build ioctl arg
+            // Build whole-file ioctl arg
             CodeSignEnableArg arg = new CodeSignEnableArg();
             arg.hashAlgorithm = parsed.hashAlgorithm;
             arg.blockSize = 1 << parsed.logBlockSize;
@@ -152,6 +165,47 @@ public final class ApkVerifyTool {
             } else {
                 System.err.println("ioctl failed with error: " + ret);
                 System.exit(1);
+            }
+
+            // Per-SO ioctl calls
+            if (parsed.nativeLibCount > 0) {
+                for (CodeSignBlockParser.NativeLibEntry entry : parsed.nativeLibEntries) {
+                    System.out.println("Enabling code sign for: " + entry.fileName);
+                    CodeSignEnableArg soArg = new CodeSignEnableArg();
+                    soArg.hashAlgorithm = parsed.hashAlgorithm;
+                    soArg.blockSize = 1 << parsed.logBlockSize;
+                    soArg.sigSize = entry.sigSize;
+                    soArg.signature = entry.signature;
+                    soArg.dataSize = entry.dataSize;
+                    soArg.treeOffset = 0;
+                    soArg.rootHash = entry.rootHash;
+                    soArg.pgtypeinfoOff = entry.soMapOffset;
+                    soArg.pgtypeinfoSize = (int) entry.soMapSize;
+                    soArg.flags = 1; // CSB_SIGN_INFO_MERKLE_TREE — root hash present
+
+                    int soRet = FsVerityEnabler.enableCodeSign(
+                            apkPath,
+                            soArg.version,
+                            soArg.csVersion,
+                            soArg.hashAlgorithm,
+                            soArg.blockSize,
+                            soArg.salt != null ? soArg.salt : new byte[0],
+                            soArg.signature,
+                            soArg.dataSize,
+                            soArg.treeOffset,
+                            soArg.rootHash,
+                            soArg.pgtypeinfoOff,
+                            soArg.pgtypeinfoSize,
+                            soArg.flags);
+
+                    if (soRet == 0) {
+                        System.out.println("  Enabled for " + entry.fileName);
+                    } else {
+                        System.err.println("  ioctl failed for " + entry.fileName
+                                + " with error: " + soRet);
+                        System.exit(1);
+                    }
+                }
             }
         }
     }

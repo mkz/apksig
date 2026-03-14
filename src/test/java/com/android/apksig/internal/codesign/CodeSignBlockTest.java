@@ -24,6 +24,9 @@ import org.junit.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 /**
  * Unit tests for {@link CodeSignBlock} build and {@link CodeSignBlockParser} parse round-trip.
@@ -162,5 +165,129 @@ public class CodeSignBlockTest {
         assertEquals(131, parsed.sigSize);
         assertEquals(dataSize, parsed.dataSize);
         assertNotNull(parsed.rootHash);
+    }
+
+    @Test
+    public void testBuildAndParseRoundTrip_withNativeLibs() {
+        byte[] rootHash = new byte[64];
+        rootHash[0] = 0x11;
+        byte[] signature = new byte[256];
+        signature[0] = 0x30;
+
+        // Create 2 mock .so entries
+        byte[] soRootHash1 = new byte[64];
+        soRootHash1[0] = (byte) 0xAA;
+        soRootHash1[31] = (byte) 0xBB;
+        byte[] soSig1 = new byte[200];
+        soSig1[0] = 0x31;
+
+        byte[] soRootHash2 = new byte[64];
+        soRootHash2[0] = (byte) 0xCC;
+        byte[] soSig2 = new byte[180];
+        soSig2[0] = 0x32;
+
+        List<NativeLibSignInfo> nativeLibs = new ArrayList<>();
+        nativeLibs.add(new NativeLibSignInfo(
+                "lib/arm64-v8a/libfoo.so", 65536, 4096, soRootHash1, soSig1));
+        nativeLibs.add(new NativeLibSignInfo(
+                "lib/arm64-v8a/libbar.so", 32768, 70000, soRootHash2, soSig2));
+
+        byte[] block = CodeSignBlock.build(
+                rootHash, signature, 1048576, 8192, 512, nativeLibs);
+        assertNotNull(block);
+
+        CodeSignBlockParser parsed = CodeSignBlockParser.parse(block);
+
+        // Verify whole-file fields still work
+        assertEquals(1048576, parsed.dataSize);
+        assertEquals(0x11, parsed.rootHash[0]);
+        assertTrue(parsed.hasPageInfo);
+
+        // Verify native lib entries
+        assertEquals(2, parsed.nativeLibCount);
+        assertEquals(2, parsed.nativeLibEntries.size());
+
+        CodeSignBlockParser.NativeLibEntry e0 = parsed.nativeLibEntries.get(0);
+        assertEquals("lib/arm64-v8a/libfoo.so", e0.fileName);
+        assertEquals(65536, e0.dataSize);
+        assertEquals(4096, e0.soMapOffset);
+        assertEquals(65536, e0.soMapSize);
+        assertEquals(200, e0.sigSize);
+        assertEquals((byte) 0xAA, e0.rootHash[0]);
+        assertEquals((byte) 0xBB, e0.rootHash[31]);
+        assertArrayEquals(soSig1, e0.signature);
+
+        CodeSignBlockParser.NativeLibEntry e1 = parsed.nativeLibEntries.get(1);
+        assertEquals("lib/arm64-v8a/libbar.so", e1.fileName);
+        assertEquals(32768, e1.dataSize);
+        assertEquals(70000, e1.soMapOffset);
+        assertEquals(32768, e1.soMapSize);
+        assertEquals(180, e1.sigSize);
+        assertEquals((byte) 0xCC, e1.rootHash[0]);
+        assertArrayEquals(soSig2, e1.signature);
+    }
+
+    @Test
+    public void testBuildAndParseRoundTrip_emptyNativeLibs() {
+        byte[] rootHash = new byte[64];
+        byte[] signature = new byte[128];
+
+        byte[] block = CodeSignBlock.build(
+                rootHash, signature, 4096, 0, 0, Collections.<NativeLibSignInfo>emptyList());
+
+        CodeSignBlockParser parsed = CodeSignBlockParser.parse(block);
+
+        assertEquals(0, parsed.nativeLibCount);
+        assertTrue(parsed.nativeLibEntries.isEmpty());
+    }
+
+    @Test
+    public void testNativeLibSignInfoAlignment() {
+        // Test with signatures that are not 4-byte aligned to verify padding
+        byte[] soRootHash1 = new byte[64];
+        byte[] soSig1 = new byte[131]; // 131 % 4 = 3
+
+        byte[] soRootHash2 = new byte[64];
+        soRootHash2[0] = (byte) 0xDD;
+        byte[] soSig2 = new byte[129]; // 129 % 4 = 1
+
+        List<NativeLibSignInfo> nativeLibs = new ArrayList<>();
+        nativeLibs.add(new NativeLibSignInfo(
+                "lib/x86/liba.so", 1000, 500, soRootHash1, soSig1));
+        nativeLibs.add(new NativeLibSignInfo(
+                "lib/x86/libb.so", 2000, 1500, soRootHash2, soSig2));
+
+        byte[] rootHash = new byte[64];
+        byte[] signature = new byte[256];
+
+        byte[] block = CodeSignBlock.build(
+                rootHash, signature, 4096, 0, 0, nativeLibs);
+
+        // Verify the segment bytes are 4-byte aligned for SignInfo objects
+        byte[] segBytes = CodeSignBlock.buildNativeLibInfoSegment(nativeLibs);
+        // segBytes length should be 4-byte aligned overall
+        // Each SignInfo offset from the entry table should be 4-byte aligned
+        ByteBuffer seg = ByteBuffer.wrap(segBytes).order(ByteOrder.LITTLE_ENDIAN);
+        seg.getInt(); // magic
+        seg.getInt(); // segmentSize
+        int sectionNum = seg.getInt();
+        assertEquals(2, sectionNum);
+
+        for (int i = 0; i < sectionNum; i++) {
+            int fnOff = seg.getInt();
+            int fnSize = seg.getInt();
+            int siOff = seg.getInt();
+            int siSize = seg.getInt();
+            // SignInfo offsets should be 4-byte aligned
+            assertEquals("SignInfo offset not 4-byte aligned for entry " + i,
+                    0, siOff % 4);
+        }
+
+        // Verify round-trip
+        CodeSignBlockParser parsed = CodeSignBlockParser.parse(block);
+        assertEquals(2, parsed.nativeLibCount);
+        assertEquals("lib/x86/liba.so", parsed.nativeLibEntries.get(0).fileName);
+        assertEquals("lib/x86/libb.so", parsed.nativeLibEntries.get(1).fileName);
+        assertEquals((byte) 0xDD, parsed.nativeLibEntries.get(1).rootHash[0]);
     }
 }

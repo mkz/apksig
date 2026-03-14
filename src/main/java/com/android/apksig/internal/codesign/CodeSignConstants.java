@@ -65,9 +65,13 @@ public final class CodeSignConstants {
     public static final int PAGE_INFO_EXT_DATA_SIZE_WITHOUT_SIGN = 24;
     public static final byte PAGE_INFO_DEFAULT_UNIT_SIZE = 4;
 
-    // --- NativeLibInfoSegment stub ---
+    // --- NativeLibInfoSegment ---
     public static final int NATIVE_LIB_INFO_MAGIC = 0x0ED2E720;
     public static final int NATIVE_LIB_INFO_STUB_SIZE = 12;
+    /** Size of each entry in the NativeLibInfoSegment entry table. */
+    public static final int NATIVE_LIB_ENTRY_SIZE = 16;
+    /** SignInfo flag: Merkle tree root hash is included. */
+    public static final int FLAG_MERKLE_TREE_INCLUDED = 0x1;
 
     // --- FsVerityDescriptor ---
     public static final int DESCRIPTOR_SIZE = 256;

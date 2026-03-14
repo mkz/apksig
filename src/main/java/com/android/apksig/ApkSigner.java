@@ -30,6 +30,7 @@ import com.android.apksig.internal.apk.v3.V3SchemeConstants;
 import com.android.apksig.internal.codesign.CodeSignBlock;
 import com.android.apksig.internal.codesign.CodeSignConstants;
 import com.android.apksig.internal.codesign.FsVerityDescriptor;
+import com.android.apksig.internal.codesign.NativeLibSignInfo;
 import com.android.apksig.internal.pkcs7.AlgorithmIdentifier;
 import com.android.apksig.internal.util.AndroidSdkVersion;
 import com.android.apksig.internal.util.ByteBufferDataSource;
@@ -1293,7 +1294,7 @@ public class ApkSigner {
         // The LFH section is everything from offset 0 to outputCentralDirStartOffset.
         DataSource lfhSection = outputApkIn.slice(0, lfhSectionSize);
 
-        // Compute root hash using VerityTreeBuilder (SHA-256, no salt).
+        // Compute whole-file root hash using VerityTreeBuilder (SHA-256, no salt).
         byte[] rootHash32;
         try (VerityTreeBuilder vtb = new VerityTreeBuilder(null)) {
             rootHash32 = vtb.generateVerityTreeRootHash(lfhSection);
@@ -1307,11 +1308,6 @@ public class ApkSigner {
         long mapSize = 0;
         for (CentralDirectoryRecord cd : outputCdRecords) {
             if (ApkPageInfoGenerator.PAGES_INFO_ENTRY_NAME.equals(cd.getName())) {
-                // Data offset = LFH offset + 30 + name_length + extra_length
-                // But we can get it from the LocalFileRecord. However, we don't have that
-                // here. Use the CD record info: LFH offset + header size.
-                // For a stored entry we created: header = 30 + name + extra.
-                // Get the actual LFR to find the data start.
                 try {
                     LocalFileRecord lfr = LocalFileRecord.getRecord(
                             lfhSection, cd, lfhSection.size());
@@ -1325,7 +1321,7 @@ public class ApkSigner {
             }
         }
 
-        // Build FsVerityDescriptor for signing.
+        // Build FsVerityDescriptor for whole-file signing.
         FsVerityDescriptor descriptor = new FsVerityDescriptor(
                 CodeSignConstants.HASH_ALGORITHM_SHA256,
                 CodeSignConstants.LOG2_BLOCK_SIZE_4096,
@@ -1338,15 +1334,74 @@ public class ApkSigner {
                 mapOffset,
                 mapSize,
                 CodeSignConstants.PAGE_INFO_DEFAULT_UNIT_SIZE);
-        byte[] descriptorDigestBytes = descriptor.getDigestBytes();
 
-        // Sign the descriptor with PKCS#7 using the first signer's key.
+        byte[] pkcs7Signature = signDescriptorPkcs7(engine, descriptor.getDigestBytes());
+
+        // Compute per-SO signing data for NATIVE_LIB entries.
+        List<NativeLibSignInfo> nativeLibs = new ArrayList<>();
+        for (CentralDirectoryRecord cd : outputCdRecords) {
+            if (classifyEntry(cd) != ApkEntryType.NATIVE_LIB) {
+                continue;
+            }
+            try {
+                LocalFileRecord lfr = LocalFileRecord.getRecord(
+                        lfhSection, cd, lfhSection.size());
+                long soDataOffset = cd.getLocalFileHeaderOffset()
+                        + lfr.getDataStartOffsetInRecord();
+                long soSize = cd.getUncompressedSize();
+                DataSource soDataSource = lfhSection.slice(soDataOffset, soSize);
+
+                // Compute per-SO root hash.
+                byte[] soRootHash32;
+                try (VerityTreeBuilder vtb = new VerityTreeBuilder(null)) {
+                    soRootHash32 = vtb.generateVerityTreeRootHash(soDataSource);
+                }
+                byte[] soRootHash = new byte[CodeSignConstants.ROOT_HASH_SIZE];
+                System.arraycopy(soRootHash32, 0, soRootHash, 0, soRootHash32.length);
+
+                // Build per-SO FsVerityDescriptor and sign it.
+                FsVerityDescriptor soDescriptor = new FsVerityDescriptor(
+                        CodeSignConstants.HASH_ALGORITHM_SHA256,
+                        CodeSignConstants.LOG2_BLOCK_SIZE_4096,
+                        (byte) 0,
+                        soSize,
+                        soRootHash,
+                        new byte[CodeSignConstants.SALT_SIZE],
+                        0, // flags
+                        0, // merkleTreeOffset
+                        soDataOffset,
+                        soSize,
+                        (byte) 0); // unitSize = 0 for per-SO
+                byte[] soPkcs7 = signDescriptorPkcs7(engine, soDescriptor.getDigestBytes());
+
+                nativeLibs.add(new NativeLibSignInfo(
+                        cd.getName(), soSize, soDataOffset, soRootHash, soPkcs7));
+            } catch (ZipFormatException e) {
+                throw new IOException("Failed to read native lib LFR: " + cd.getName(), e);
+            }
+        }
+        // Sort alphabetically by filename.
+        nativeLibs.sort(Comparator.comparing(NativeLibSignInfo::getFileName));
+
+        // Assemble the code sign block.
+        byte[] codeSignBlock = CodeSignBlock.build(
+                rootHash, pkcs7Signature, lfhSectionSize, mapOffset, mapSize, nativeLibs);
+
+        engine.setCodeSignBlock(codeSignBlock);
+    }
+
+    /**
+     * Signs a 256-byte FsVerityDescriptor digest with PKCS#7 using the engine's first signer.
+     */
+    private static byte[] signDescriptorPkcs7(
+            DefaultApkSignerEngine engine, byte[] descriptorDigestBytes)
+            throws InvalidKeyException, SignatureException, NoSuchAlgorithmException {
+
         DefaultApkSignerEngine.SignerConfig signerConfig = engine.getFirstSignerConfig();
         KeyConfig keyConfig = signerConfig.getKeyConfig();
         List<X509Certificate> certs = signerConfig.getCertificates();
         PublicKey publicKey = certs.get(0).getPublicKey();
 
-        // Determine JCA signature algorithm based on key type.
         String keyAlgorithm = publicKey.getAlgorithm();
         String jcaSignatureAlgorithm;
         if ("RSA".equalsIgnoreCase(keyAlgorithm)) {
@@ -1359,7 +1414,6 @@ public class ApkSigner {
             throw new InvalidKeyException("Unsupported key algorithm: " + keyAlgorithm);
         }
 
-        // Cryptographically sign the descriptor.
         byte[] signatureBytes;
         try {
             signatureBytes = SignerEngineFactory.getImplementation(
@@ -1368,7 +1422,6 @@ public class ApkSigner {
             throw new SignatureException("Failed to sign code sign descriptor", e);
         }
 
-        // Build PKCS#7 DER-encoded message using the V1 signer's algorithm selection.
         com.android.apksig.internal.util.Pair<String, AlgorithmIdentifier> sigAlgPair;
         try {
             sigAlgPair = AlgorithmIdentifier.getSignerInfoSignatureAlgorithm(
@@ -1382,19 +1435,12 @@ public class ApkSigner {
                 com.android.apksig.internal.apk.v1.DigestAlgorithm.SHA256);
         AlgorithmIdentifier sigAlgId = sigAlgPair.getSecond();
 
-        byte[] pkcs7Signature;
         try {
-            pkcs7Signature = ApkSigningBlockUtils.generatePkcs7DerEncodedMessage(
+            return ApkSigningBlockUtils.generatePkcs7DerEncodedMessage(
                     signatureBytes, null, certs, digestAlgId, sigAlgId);
         } catch (Exception e) {
             throw new SignatureException("Failed to generate PKCS#7 code sign signature", e);
         }
-
-        // Assemble the code sign block.
-        byte[] codeSignBlock = CodeSignBlock.build(
-                rootHash, pkcs7Signature, lfhSectionSize, mapOffset, mapSize);
-
-        engine.setCodeSignBlock(codeSignBlock);
     }
 
     /**
